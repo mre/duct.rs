@@ -29,7 +29,6 @@
 //! assert!(output.split_whitespace().eq(vec!["foo", "bar"]));
 //! ```
 
-extern crate crossbeam;
 extern crate os_pipe;
 
 use std::collections::HashMap;
@@ -42,7 +41,7 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio, Output, ExitStatus};
+use std::process::{Command, Child, Stdio, Output, ExitStatus};
 use std::thread::JoinHandle;
 use std::sync::Arc;
 
@@ -145,28 +144,41 @@ pub fn sh<T: ToExecutable>(command: T) -> Expression {
 
 #[derive(Clone, Debug)]
 #[must_use]
-pub struct Expression {
-    inner: Arc<ExpressionInner>,
-}
+pub struct Expression(Arc<ExpressionInner>);
 
 impl Expression {
-    pub fn run(&self) -> Result<Output, Error> {
-        let (context, stdout_reader, stderr_reader) = IoContext::new()?;
-        let status = self.inner.exec(context)?;
-        // These unwraps propagate any panics from the other thread,
-        // but regular errors return normally.
-        let stdout_vec = stdout_reader.join().unwrap()?;
-        let stderr_vec = stderr_reader.join().unwrap()?;
-        let output = Output {
-            status: status,
-            stdout: stdout_vec,
-            stderr: stderr_vec,
-        };
-        if !output.status.success() {
-            Err(Error::Status(output))
-        } else {
-            Ok(output)
+    /// Start running an expression, and immediately return a `WaitHandle`.
+    ///
+    /// Note that this returns a `WaitHandle` directly, not an
+    /// `io::Result<WaitHandle>`. That means that any IO errors that happen
+    /// during spawn (like a misspelled program name) won't show up until you
+    /// `wait` on the handle. Why do it that way? Because early errors don't
+    /// work with more complicated expressions involving  `then` and `pipe`.
+    ///
+    /// The problem with `then` is that spawn errors in the right child don't
+    /// happen on the main thread. Instead there's a worker thread waiting on
+    /// the left child to finish, and it's that worker's job to spawn the right
+    /// child. The only way to return errors at that point is through the
+    /// WaitClosure, so a "return spawn errors immediately" design would be
+    /// inconsistent at best.
+    ///
+    /// The problem with `pipe` is worse. Both children start immediately, so if
+    /// a spawn error happens on the right, the left is already running. Someone
+    /// has to wait on it, or we'll leak a zombie process. But the left child
+    /// might take a long time to finish, and it's not ok for `start` to block.
+    /// Instead, we need the caller to `wait` as usual, so that we can do this
+    /// cleanup.
+    pub fn start(&self) -> WaitHandle {
+        let (context, stdout_reader, stderr_reader) = IoContext::new();
+        WaitHandle {
+            closure: self.0.exec(context),
+            stdout_reader: stdout_reader,
+            stderr_reader: stderr_reader,
         }
+    }
+
+    pub fn run(&self) -> Result<Output, Error> {
+        self.start().wait()
     }
 
     pub fn read(&self) -> Result<String, Error> {
@@ -266,7 +278,47 @@ impl Expression {
     }
 
     fn new(inner: ExpressionInner) -> Self {
-        Expression { inner: Arc::new(inner) }
+        Expression(Arc::new(inner))
+    }
+}
+
+type WaitClosure = Box<FnOnce() -> io::Result<ExitStatus> + Send>;
+
+#[must_use]
+pub struct WaitHandle {
+    closure: WaitClosure,
+    stdout_reader: ReaderThread,
+    stderr_reader: ReaderThread,
+}
+
+impl WaitHandle {
+    pub fn wait(self) -> Result<Output, Error> {
+        // Wait for the children and both reader threads, before propagating any
+        // errors or panics, to avoid leaving zombies.
+        let status_result = (self.closure)();
+        let stdout_preresult = self.stdout_reader.join();
+        let stderr_preresult = self.stderr_reader.join();
+        // Propagate any panics from the reader threads.
+        let stdout_result = stdout_preresult.unwrap();
+        let stderr_result = stderr_preresult.unwrap();
+        // Short-circuit for any IO errors, letting errors from children take
+        // precedence over the readers.
+        let status = status_result?;
+        let stdout_vec = stdout_result?;
+        let stderr_vec = stderr_result?;
+        // Finally, the happy path, check the exit status of the children and
+        // return their output. This is where we enforce that a non-zero status
+        // counts as an error.
+        let output = Output {
+            status: status,
+            stdout: stdout_vec,
+            stderr: stderr_vec,
+        };
+        if !output.status.success() {
+            Err(Error::Status(output))
+        } else {
+            Ok(output)
+        }
     }
 }
 
@@ -280,7 +332,7 @@ enum ExpressionInner {
 }
 
 impl ExpressionInner {
-    fn exec(&self, context: IoContext) -> io::Result<ExitStatus> {
+    fn exec(&self, context: IoContext) -> WaitClosure {
         match *self {
             Cmd(ref argv) => exec_argv(argv, context),
             Sh(ref command) => exec_sh(command, context),
@@ -291,63 +343,31 @@ impl ExpressionInner {
     }
 }
 
-fn maybe_canonicalize_exe_path(exe_name: &OsStr, context: &IoContext) -> io::Result<OsString> {
-    // There's a tricky interaction between exe paths and `dir`. Exe
-    // paths can be relative, and so we have to ask: Is an exe path
-    // interpreted relative to the parent's cwd, or the child's? The
-    // answer is that it's platform dependent! >.< (Windows uses the
-    // parent's cwd, but because of the fork-chdir-exec pattern, Unix
-    // usually uses the child's.)
-    //
-    // We want to use the parent's cwd consistently, because that saves
-    // the caller from having to worry about whether `dir` will have
-    // side effects, and because it's easy for the caller to use
-    // Path::join if they want to. That means that when `dir` is in use,
-    // we need to detect exe names that are relative paths, and
-    // absolutify them. We want to do that as little as possible though,
-    // both because canonicalization can fail, and because we prefer to
-    // let the caller control the child's argv[0].
-    //
-    // We never want to absolutify a name like "emacs", because that's
-    // probably a program in the PATH rather than a local file. So we
-    // look for slashes in the name to determine what's a filepath and
-    // what isn't. Note that anything given as a std::path::Path will
-    // always have a slash by the time we get here, because we
-    // specialize the ToExecutable trait to prepend a ./ to them when
-    // they're relative. This leaves the case where Windows users might
-    // pass a local file like "foo.bat" as a string, which we can't
-    // distinguish from a global program name. However, because the
-    // Windows has the preferred "relative to parent's cwd" behavior
-    // already, this case actually works without our help. (The thing
-    // Windows users have to watch out for instead is local files
-    // shadowing global program names, which I don't think we can or
-    // should prevent.)
+fn exec_argv(argv: &[OsString], context: IoContext) -> WaitClosure {
+    let setup = || {
+        let exe = maybe_canonicalize_exe_path(&argv[0], &context)?;
+        let mut command = Command::new(exe);
+        command.args(&argv[1..]);
+        // TODO: Avoid unnecessary dup'ing here.
+        command.stdin(context.stdin.into_stdio()?);
+        command.stdout(context.stdout.into_stdio()?);
+        command.stderr(context.stderr.into_stdio()?);
+        if let Some(dir) = context.dir {
+            command.current_dir(dir);
+        }
+        command.env_clear();
+        for (name, val) in context.env {
+            command.env(name, val);
+        }
+        command.spawn()
+    };
 
-    let has_separator = exe_name.to_string_lossy().chars().any(std::path::is_separator);
-    let is_relative = Path::new(exe_name).is_relative();
-    if context.dir.is_some() && has_separator && is_relative {
-        Path::new(exe_name).canonicalize().map(Into::into)
-    } else {
-        Ok(exe_name.to_owned())
-    }
-}
+    let maybe_child = setup();
 
-fn exec_argv(argv: &[OsString], context: IoContext) -> io::Result<ExitStatus> {
-    let exe = maybe_canonicalize_exe_path(&argv[0], &context)?;
-    let mut command = Command::new(exe);
-    command.args(&argv[1..]);
-    // TODO: Avoid unnecessary dup'ing here.
-    command.stdin(context.stdin.into_stdio()?);
-    command.stdout(context.stdout.into_stdio()?);
-    command.stderr(context.stderr.into_stdio()?);
-    if let Some(dir) = context.dir {
-        command.current_dir(dir);
-    }
-    command.env_clear();
-    for (name, val) in context.env {
-        command.env(name, val);
-    }
-    command.status()
+    Box::new(|| {
+        let mut child = maybe_child?;
+        child.wait()
+    })
 }
 
 #[cfg(unix)]
@@ -361,60 +381,84 @@ fn shell_command_argv(command: OsString) -> [OsString; 3] {
     [comspec, OsStr::new("/C").to_owned(), command]
 }
 
-fn exec_sh(command: &OsString, context: IoContext) -> io::Result<ExitStatus> {
+fn exec_sh(command: &OsString, context: IoContext) -> WaitClosure {
     exec_argv(&shell_command_argv(command.clone()), context)
 }
 
-fn exec_pipe(left: &Expression, right: &Expression, context: IoContext) -> io::Result<ExitStatus> {
-    let pipe = os_pipe::pipe()?;
-    let mut left_context = context.try_clone()?;  // dup'ing stdin/stdout isn't strictly necessary, but no big deal
-    left_context.stdout = IoValue::File(pipe.writer);
-    let mut right_context = context;
-    right_context.stdin = IoValue::File(pipe.reader);
+fn exec_pipe(left: &Expression, right: &Expression, context: IoContext) -> WaitClosure {
+    let setup = || -> io::Result<_> {
+        let pipe = os_pipe::pipe()?;
+        let mut left_context = context.try_clone()?;  // dup'ing stdin/stdout isn't strictly necessary, but no big deal
+        left_context.stdout = IoValue::File(pipe.writer);
+        let mut right_context = context;
+        right_context.stdin = IoValue::File(pipe.reader);
+        let left_closure = left.0.exec(left_context);
+        let right_closure = right.0.exec(right_context);
+        Ok((left_closure, right_closure))
+    };
 
-    let (left_result, right_result) = crossbeam::scope(|scope| {
-        let left_joiner = scope.spawn(|| left.inner.exec(left_context));
-        let right_result = right.inner.exec(right_context);
-        let left_result = left_joiner.join();
-        (left_result, right_result)
+    let maybe_closures = setup();
+
+    Box::new(|| {
+        let (left_closure, right_closure) = maybe_closures?;
+        let right_result = right_closure();
+        let left_result = left_closure();
+        let right_status = right_result?;
+        let left_status = left_result?;
+        if !right_status.success() {
+            Ok(right_status)
+        } else {
+            Ok(left_status)
+        }
+    })
+}
+
+fn exec_then(left: &Expression, right: &Expression, context: IoContext) -> WaitClosure {
+    // All the exec functions have to return immediately, but `then` needs to
+    // wait on the left side to finish before the right side can start. We use a
+    // worker thread to do that.
+    let left_clone = left.clone();
+    let right_clone = right.clone();
+    let thread_handle = std::thread::spawn(move || {
+        let left_closure = left_clone.0.exec(context.try_clone()?);
+        let left_status = left_closure()?;
+        if !left_status.success() {
+            Ok(left_status)
+        } else {
+            let right_closure = right_clone.0.exec(context);
+            right_closure()
+        }
     });
-
-    let right_status = right_result?;
-    let left_status = left_result?;
-    if !right_status.success() {
-        Ok(right_status)
-    } else {
-        Ok(left_status)
-    }
+    Box::new(|| thread_handle.join().unwrap())
 }
 
-fn exec_then(left: &Expression, right: &Expression, context: IoContext) -> io::Result<ExitStatus> {
-    let status = left.inner.exec(context.try_clone()?)?;
-    if !status.success() {
-        Ok(status)
-    } else {
-        right.inner.exec(context)
-    }
-}
-
-fn exec_io(io_inner: &IoExpressionInner,
-           expr: &Expression,
-           context: IoContext)
-           -> io::Result<ExitStatus> {
+fn exec_io(io_inner: &IoExpressionInner, expr: &Expression, context: IoContext) -> WaitClosure {
     {
-        crossbeam::scope(|scope| {
-            let (new_context, maybe_writer_thread) = io_inner.update_context(context, scope)?;
-            let exec_result = expr.inner.exec(new_context);
+        let is_unchecked = match *io_inner {
+            Unchecked => true,
+            _ => false,
+        };
+        let setup = || -> io::Result<_> {
+            let (new_context, maybe_writer_thread) = io_inner.update_context(context)?;
+            let child_closure = expr.0.exec(new_context);
+            Ok((child_closure, maybe_writer_thread))
+        };
+
+        let maybe_waiters = setup();
+
+        Box::new(|| {
+            let (child_closure, maybe_writer_thread) = maybe_waiters?;
+            // Wait on both before short-circuiting with either of their errors.
+            let child_result = child_closure();
             let writer_result = join_maybe_writer_thread(maybe_writer_thread);
-            // Propagate any exec errors first.
-            let exec_status = exec_result?;
-            // Then propagate any writer thread errors.
+            // Then propagate errors, with the child taking precedence.
+            let child_status = child_result?;
             writer_result?;
             // Finally, implement unchecked() status suppression here.
-            if let &Unchecked = io_inner {
+            if is_unchecked {
                 Ok(ExitStatus::from_raw(0))
             } else {
-                Ok(exec_status)
+                Ok(child_status)
             }
         })
     }
@@ -443,14 +487,13 @@ enum IoExpressionInner {
 }
 
 impl IoExpressionInner {
-    fn update_context<'a>(&'a self,
-                          mut context: IoContext,
-                          scope: &crossbeam::Scope<'a>)
-                          -> io::Result<(IoContext, Option<WriterThread>)> {
+    fn update_context(&self,
+                      mut context: IoContext)
+                      -> io::Result<(IoContext, Option<WriterThread>)> {
         let mut maybe_thread = None;
         match *self {
             Input(ref v) => {
-                let (reader, thread) = pipe_with_writer_thread(v, scope)?;
+                let (reader, thread) = pipe_with_writer_thread(v)?;
                 context.stdin = IoValue::File(reader);
                 maybe_thread = Some(thread)
             }
@@ -617,8 +660,9 @@ struct IoContext {
 }
 
 impl IoContext {
-    // Returns (context, stdout_reader, stderr_reader).
-    fn new() -> io::Result<(IoContext, ReaderThread, ReaderThread)> {
+    // Returns (context, stdout_reader, stderr_reader). Because this is called
+    // in `start`, it can't return errors.
+    fn new() -> (IoContext, ReaderThread, ReaderThread) {
         let (stdout_capture, stdout_reader) = pipe_with_reader_thread()?;
         let (stderr_capture, stderr_reader) = pipe_with_reader_thread()?;
         let mut env = HashMap::new();
@@ -693,13 +737,11 @@ fn pipe_with_reader_thread() -> io::Result<(File, ReaderThread)> {
     Ok((writer, thread))
 }
 
-type WriterThread = crossbeam::ScopedJoinHandle<io::Result<()>>;
+type WriterThread = std::thread::JoinHandle<io::Result<()>>;
 
-fn pipe_with_writer_thread<'a>(input: &'a [u8],
-                               scope: &crossbeam::Scope<'a>)
-                               -> io::Result<(File, WriterThread)> {
+fn pipe_with_writer_thread(input: &[u8]) -> io::Result<(File, WriterThread)> {
     let os_pipe::Pipe { reader, mut writer } = os_pipe::pipe()?;
-    let thread = scope.spawn(move || {
+    let thread = std::thread::spawn(move || {
         writer.write_all(&input)?;
         Ok(())
     });
@@ -711,7 +753,7 @@ fn join_maybe_writer_thread(maybe_writer_thread: Option<WriterThread>) -> io::Re
         // A broken pipe error happens if the process on the other end exits before
         // we're done writing. We ignore those but return any other errors to the
         // caller.
-        suppress_broken_pipe_errors(thread.join())
+        suppress_broken_pipe_errors(thread.join().unwrap())
     } else {
         Ok(())
     }
@@ -729,6 +771,47 @@ fn suppress_broken_pipe_errors(r: io::Result<()>) -> io::Result<()> {
 
 fn trim_right_newlines(s: &str) -> &str {
     s.trim_right_matches(|c| c == '\n' || c == '\r')
+}
+
+fn maybe_canonicalize_exe_path(exe_name: &OsStr, context: &IoContext) -> io::Result<OsString> {
+    // There's a tricky interaction between exe paths and `dir`. Exe
+    // paths can be relative, and so we have to ask: Is an exe path
+    // interpreted relative to the parent's cwd, or the child's? The
+    // answer is that it's platform dependent! >.< (Windows uses the
+    // parent's cwd, but because of the fork-chdir-exec pattern, Unix
+    // usually uses the child's.)
+    //
+    // We want to use the parent's cwd consistently, because that saves
+    // the caller from having to worry about whether `dir` will have
+    // side effects, and because it's easy for the caller to use
+    // Path::join if they want to. That means that when `dir` is in use,
+    // we need to detect exe names that are relative paths, and
+    // absolutify them. We want to do that as little as possible though,
+    // both because canonicalization can fail, and because we prefer to
+    // let the caller control the child's argv[0].
+    //
+    // We never want to absolutify a name like "emacs", because that's
+    // probably a program in the PATH rather than a local file. So we
+    // look for slashes in the name to determine what's a filepath and
+    // what isn't. Note that anything given as a std::path::Path will
+    // always have a slash by the time we get here, because we
+    // specialize the ToExecutable trait to prepend a ./ to them when
+    // they're relative. This leaves the case where Windows users might
+    // pass a local file like "foo.bat" as a string, which we can't
+    // distinguish from a global program name. However, because the
+    // Windows has the preferred "relative to parent's cwd" behavior
+    // already, this case actually works without our help. (The thing
+    // Windows users have to watch out for instead is local files
+    // shadowing global program names, which I don't think we can or
+    // should prevent.)
+
+    let has_separator = exe_name.to_string_lossy().chars().any(std::path::is_separator);
+    let is_relative = Path::new(exe_name).is_relative();
+    if context.dir.is_some() && has_separator && is_relative {
+        Path::new(exe_name).canonicalize().map(Into::into)
+    } else {
+        Ok(exe_name.to_owned())
+    }
 }
 
 #[cfg(test)]
