@@ -169,12 +169,43 @@ impl Expression {
     /// Instead, we need the caller to `wait` as usual, so that we can do this
     /// cleanup.
     pub fn start(&self) -> WaitHandle {
-        let (context, stdout_reader, stderr_reader) = IoContext::new();
-        WaitHandle {
-            closure: self.0.exec(context),
-            stdout_reader: stdout_reader,
-            stderr_reader: stderr_reader,
-        }
+        let setup = || -> io::Result<_> {
+            let (context, stdout_reader, stderr_reader) = IoContext::new()?;
+            let exec_closure = self.0.exec(context);
+            Ok((exec_closure, stdout_reader, stderr_reader))
+        };
+
+        let maybe_closure_and_readers = setup();
+
+        WaitHandle(Box::new(|| {
+            let (exec_closure, stdout_reader, stderr_reader) = maybe_closure_and_readers?;
+            // Wait for the children and both reader threads, before propagating
+            // any of their errors or panics, to avoid leaving zombies.
+            let status_result = exec_closure();
+            let stdout_preresult = stdout_reader.join();
+            let stderr_preresult = stderr_reader.join();
+            // Propagate any panics from the reader threads.
+            let stdout_result = stdout_preresult.unwrap();
+            let stderr_result = stderr_preresult.unwrap();
+            // Short-circuit for any IO errors, letting errors from children take
+            // precedence over the readers.
+            let status = status_result?;
+            let stdout_vec = stdout_result?;
+            let stderr_vec = stderr_result?;
+            // Finally, the happy path, check the exit status of the children and
+            // return their output. This is where we enforce that a non-zero status
+            // counts as an error.
+            let output = Output {
+                status: status,
+                stdout: stdout_vec,
+                stderr: stderr_vec,
+            };
+            if !output.status.success() {
+                Err(Error::Status(output))
+            } else {
+                Ok(output)
+            }
+        }))
     }
 
     pub fn run(&self) -> Result<Output, Error> {
@@ -196,7 +227,7 @@ impl Expression {
     }
 
     pub fn input<T: Into<Vec<u8>>>(&self, input: T) -> Self {
-        Self::new(Io(Input(input.into()), self.clone()))
+        Self::new(Io(Input(Arc::new(input.into())), self.clone()))
     }
 
     pub fn stdin<T: Into<PathBuf>>(&self, path: T) -> Self {
@@ -282,43 +313,15 @@ impl Expression {
     }
 }
 
-type WaitClosure = Box<FnOnce() -> io::Result<ExitStatus> + Send>;
+type ExecClosure = Box<std::boxed::FnBox() -> io::Result<ExitStatus> + Send>;
+type WaitClosure = Box<std::boxed::FnBox() -> Result<Output, Error> + Send>;
 
 #[must_use]
-pub struct WaitHandle {
-    closure: WaitClosure,
-    stdout_reader: ReaderThread,
-    stderr_reader: ReaderThread,
-}
+pub struct WaitHandle(WaitClosure);
 
 impl WaitHandle {
     pub fn wait(self) -> Result<Output, Error> {
-        // Wait for the children and both reader threads, before propagating any
-        // errors or panics, to avoid leaving zombies.
-        let status_result = (self.closure)();
-        let stdout_preresult = self.stdout_reader.join();
-        let stderr_preresult = self.stderr_reader.join();
-        // Propagate any panics from the reader threads.
-        let stdout_result = stdout_preresult.unwrap();
-        let stderr_result = stderr_preresult.unwrap();
-        // Short-circuit for any IO errors, letting errors from children take
-        // precedence over the readers.
-        let status = status_result?;
-        let stdout_vec = stdout_result?;
-        let stderr_vec = stderr_result?;
-        // Finally, the happy path, check the exit status of the children and
-        // return their output. This is where we enforce that a non-zero status
-        // counts as an error.
-        let output = Output {
-            status: status,
-            stdout: stdout_vec,
-            stderr: stderr_vec,
-        };
-        if !output.status.success() {
-            Err(Error::Status(output))
-        } else {
-            Ok(output)
-        }
+        self.0()
     }
 }
 
@@ -332,7 +335,7 @@ enum ExpressionInner {
 }
 
 impl ExpressionInner {
-    fn exec(&self, context: IoContext) -> WaitClosure {
+    fn exec(&self, context: IoContext) -> ExecClosure {
         match *self {
             Cmd(ref argv) => exec_argv(argv, context),
             Sh(ref command) => exec_sh(command, context),
@@ -343,8 +346,9 @@ impl ExpressionInner {
     }
 }
 
-fn exec_argv(argv: &[OsString], context: IoContext) -> WaitClosure {
+fn exec_argv(argv: &[OsString], context: IoContext) -> ExecClosure {
     let setup = || {
+        let context = context;
         let exe = maybe_canonicalize_exe_path(&argv[0], &context)?;
         let mut command = Command::new(exe);
         command.args(&argv[1..]);
@@ -381,11 +385,11 @@ fn shell_command_argv(command: OsString) -> [OsString; 3] {
     [comspec, OsStr::new("/C").to_owned(), command]
 }
 
-fn exec_sh(command: &OsString, context: IoContext) -> WaitClosure {
+fn exec_sh(command: &OsString, context: IoContext) -> ExecClosure {
     exec_argv(&shell_command_argv(command.clone()), context)
 }
 
-fn exec_pipe(left: &Expression, right: &Expression, context: IoContext) -> WaitClosure {
+fn exec_pipe(left: &Expression, right: &Expression, context: IoContext) -> ExecClosure {
     let setup = || -> io::Result<_> {
         let pipe = os_pipe::pipe()?;
         let mut left_context = context.try_clone()?;  // dup'ing stdin/stdout isn't strictly necessary, but no big deal
@@ -413,7 +417,7 @@ fn exec_pipe(left: &Expression, right: &Expression, context: IoContext) -> WaitC
     })
 }
 
-fn exec_then(left: &Expression, right: &Expression, context: IoContext) -> WaitClosure {
+fn exec_then(left: &Expression, right: &Expression, context: IoContext) -> ExecClosure {
     // All the exec functions have to return immediately, but `then` needs to
     // wait on the left side to finish before the right side can start. We use a
     // worker thread to do that.
@@ -432,7 +436,7 @@ fn exec_then(left: &Expression, right: &Expression, context: IoContext) -> WaitC
     Box::new(|| thread_handle.join().unwrap())
 }
 
-fn exec_io(io_inner: &IoExpressionInner, expr: &Expression, context: IoContext) -> WaitClosure {
+fn exec_io(io_inner: &IoExpressionInner, expr: &Expression, context: IoContext) -> ExecClosure {
     {
         let is_unchecked = match *io_inner {
             Unchecked => true,
@@ -446,7 +450,7 @@ fn exec_io(io_inner: &IoExpressionInner, expr: &Expression, context: IoContext) 
 
         let maybe_waiters = setup();
 
-        Box::new(|| {
+        Box::new(move || {
             let (child_closure, maybe_writer_thread) = maybe_waiters?;
             // Wait on both before short-circuiting with either of their errors.
             let child_result = child_closure();
@@ -466,7 +470,7 @@ fn exec_io(io_inner: &IoExpressionInner, expr: &Expression, context: IoContext) 
 
 #[derive(Debug)]
 enum IoExpressionInner {
-    Input(Vec<u8>),
+    Input(Arc<Vec<u8>>),
     Stdin(PathBuf),
     StdinFile(File),
     StdinNull,
@@ -493,7 +497,7 @@ impl IoExpressionInner {
         let mut maybe_thread = None;
         match *self {
             Input(ref v) => {
-                let (reader, thread) = pipe_with_writer_thread(v)?;
+                let (reader, thread) = pipe_with_writer_thread(v.clone())?;
                 context.stdin = IoValue::File(reader);
                 maybe_thread = Some(thread)
             }
@@ -662,7 +666,7 @@ struct IoContext {
 impl IoContext {
     // Returns (context, stdout_reader, stderr_reader). Because this is called
     // in `start`, it can't return errors.
-    fn new() -> (IoContext, ReaderThread, ReaderThread) {
+    fn new() -> io::Result<(IoContext, ReaderThread, ReaderThread)> {
         let (stdout_capture, stdout_reader) = pipe_with_reader_thread()?;
         let (stderr_capture, stderr_reader) = pipe_with_reader_thread()?;
         let mut env = HashMap::new();
@@ -739,7 +743,7 @@ fn pipe_with_reader_thread() -> io::Result<(File, ReaderThread)> {
 
 type WriterThread = std::thread::JoinHandle<io::Result<()>>;
 
-fn pipe_with_writer_thread(input: &[u8]) -> io::Result<(File, WriterThread)> {
+fn pipe_with_writer_thread(input: Arc<Vec<u8>>) -> io::Result<(File, WriterThread)> {
     let os_pipe::Pipe { reader, mut writer } = os_pipe::pipe()?;
     let thread = std::thread::spawn(move || {
         writer.write_all(&input)?;
